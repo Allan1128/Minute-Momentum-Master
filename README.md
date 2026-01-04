@@ -163,3 +163,4 @@ Normal to high liquidity
 Low network congestion
 
 Active trading sessions (Asia, Europe, US overlaps)
+OKX Invitation: https://www.growthnode.systems/join/59892411
