@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""
+1-Minute Perpetual Scalping Bot
+High-frequency scalping strategy for perpetual contracts on 1-minute timeframe
+Author: @HoxonAllan
+GitHub: https://github.com/Allan1128/1-Minute-Scalper-Bot
+OKX Invitation: https://www.growthnode.systems/join/59892411
+"""
+
+import ccxt
+import pandas as pd
+import numpy as np
+import time
+import json
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+class OneMinuteScalper:
+    """
+    1-minute high-frequency scalping bot for perpetual contracts
+    Implements momentum, mean reversion, and order flow strategies
+    """
+    
+    def __init__(self, exchange_id='okx', config_file='config_perp.json'):
+        self.exchange_id = exchange_id
+        self.config_file = config_file
+        self.exchange = None
+        self.positions = {}
+        self.order_history = []
+        self.initialize_exchange()
+        
+    def initialize_exchange(self):
+        """Initialize exchange connection for perpetual contracts"""
+        try:
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+            
+            exchange_class = getattr(ccxt, self.exchange_id)
+            self.exchange = exchange_class({
+                'apiKey': config.get('api_key', ''),
+                'secret': config.get('api_secret', ''),
+                'password': config.get('password', ''),
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'swap',  # Perpetual contracts
+                    'adjustForTimeDifference': True,
+                }
+            })
+            
+            print(f"Connected to {self.exchange_id.upper()} Perpetual")
+            
+        except Exception as e:
+            print(f"Exchange initialization error: {e}")
+            raise
+    
+    def fetch_perpetual_data(self, symbol, timeframe='1m', limit=200):
+        """Fetch OHLCV data for perpetual contracts"""
+        try:
+            # For OKX perpetual symbols, use BTC-USDT-SWAP format
+            if self.exchange_id == 'okx' and '-SWAP' not in symbol:
+                symbol = symbol.replace('/', '-') + '-SWAP'
+            
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            return df
+        except Exception as e:
+            print(f"Data fetch error: {e}")
+            return None
+    
+    def fetch_orderbook(self, symbol, limit=20):
+        """Fetch real-time order book data"""
+        try:
+            if self.exchange_id == 'okx' and '-SWAP' not in symbol:
+                symbol = symbol.replace('/', '-') + '-SWAP'
+            
+            orderbook = self.exchange.fetch_order_book(symbol, limit=limit)
+            return orderbook
+        except Exception as e:
+            print(f"Orderbook fetch error: {e}")
+            return None
+    
+    def calculate_scalping_indicators(self, df):
+        """Calculate high-frequency trading indicators"""
+        if df.empty or len(df) < 50:
+            return df
+        
+        df = df.copy()
+        
+        # Ultra-fast EMAs for momentum
+        df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
+        df['ema_10'] = df['close'].ewm(span=10, adjust=False).mean()
+        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
+        
+        # VWAP (Volume Weighted Average Price)
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['vwap'] = (df['typical_price'] * df['volume']).cumsum() / df['volume'].cumsum()
+        
+        # Bollinger Bands for volatility
+        df['bb_middle'] = df['close'].rolling(window=20).mean()
+        bb_std = df['close'].rolling(window=20).std()
+        df['bb_upper'] = df['bb_middle'] + (bb_std * 2)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * 2)
+        df['bb_squeeze'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle'] * 100
+        
+        # RSI for overbought/oversold
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # Stochastic Oscillator
+        df['stoch_k'] = 100 * (df['close'] - df['low'].rolling(14).min()) / \
+                        (df['high'].rolling(14).max() - df['low'].rolling(14).min())
+        df['stoch_d'] = df['stoch_k'].rolling(3).mean()
+        
+        # MACD for trend changes
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = exp1 - exp2
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        
+        # Volume indicators
+        df['volume_sma'] = df['volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_sma']
+        df['volume_change'] = df['volume'].pct_change()
+        
+        # Price action signals
+        df['higher_high'] = (df['high'] > df['high'].shift(1)).astype(int)
+        df['lower_low'] = (df['low'] < df['low'].shift(1)).astype(int)
+        df['price_change'] = df['close'].pct_change()
+        
+        # Support and Resistance levels (dynamic)
+        df['resistance'] = df['high'].rolling(window=10).max()
+        df['support'] = df['low'].rolling(window=10).min()
+        
+        # Order flow proxy (bid-ask imbalance)
+        df['close_vs_vwap'] = (df['close'] - df['vwap']) / df['vwap'] * 100
+        
+        return df
+    
+    def analyze_orderbook_signals(self, orderbook):
+        """Analyze order book for market depth and pressure"""
+        if not orderbook:
+            return 0, 0
+        
+        bids = orderbook['bids']
+        asks = orderbook['asks']
+        
+        # Calculate bid-ask imbalance
+        total_bid_volume = sum([bid[1] for bid in bids])
+        total_ask_volume = sum([ask[1] for ask in asks])
+        
+        if total_bid_volume + total_ask_volume > 0:
+            imbalance = (total_bid_volume - total_ask_volume) / (total_bid_volume + total_ask_volume)
+        else:
+            imbalance = 0
+        
+        # Calculate spread
+        best_bid = bids[0][0] if bids else 0
+        best_ask = asks[0][0] if asks else 0
+        spread_pct = (best_ask - best_bid) / best_bid * 100 if best_bid > 0 else 0
+        
+        return imbalance, spread_pct
+    
+    def generate_scalping_signal(self, df, orderbook_data=None):
+        """Generate high-frequency trading signals"""
+        if len(df) < 30:
+            return 'HOLD', 0
+        
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        
+        # Initialize scores
+        long_score = 0
+        short_score = 0
+        
+        # 1. Momentum signals
+        if latest['ema_5'] > latest['ema_10'] and latest['ema_10'] > latest['ema_20']:
+            long_score += 2
+        elif latest['ema_5'] < latest['ema_10'] and latest['ema_10'] < latest['ema_20']:
+            short_score += 2
+        
+        # 2. RSI signals (fast mean reversion)
+        if latest['rsi'] < 30:
+            long_score += 1.5
+        elif latest['rsi'] > 70:
+            short_score += 1.5
+        elif 45 < latest['rsi'] < 55:
+            # Neutral RSI - add to both for continuation
+            if latest['close'] > latest['ema_20']:
+                long_score += 0.5
+            else:
+                short_score += 0.5
+        
+        # 3. Bollinger Bands squeeze breakout
+        if latest['bb_squeeze'] < latest['bb_squeeze'].rolling(20).mean().iloc[-1]:
+            # Low volatility - look for breakout
+            if latest['close'] > latest['bb_upper']:
+                long_score += 1.5
+            elif latest['close'] < latest['bb_lower']:
+                short_score += 1.5
+        
+        # 4. Volume confirmation
+        if latest['volume_ratio'] > 1.5:
+            if latest['close'] > prev['close']:
+                long_score += 1
+            else:
+                short_score += 1
+        
+        # 5. MACD cross
+        if latest['macd'] > latest['macd_signal'] and prev['macd'] <= prev['macd_signal']:
+            long_score += 1.5
+        elif latest['macd'] < latest['macd_signal'] and prev['macd'] >= prev['macd_signal']:
+            short_score += 1.5
+        
+        # 6. Price action
+        if latest['higher_high'] and latest['close'] > latest['open']:
+            long_score += 1
+        if latest['lower_low'] and latest['close'] < latest['open']:
+            short_score += 1
+        
+        # 7. VWAP position
+        if latest['close'] > latest['vwap']:
+            long_score += 0.5
+        else:
+            short_score += 0.5
+        
+        # 8. Order book signals (if available)
+        if orderbook_data:
+            imbalance, spread = self.analyze_orderbook_signals(orderbook_data)
+            if imbalance > 0.1:  # Strong buying pressure
+                long_score += 1
+            elif imbalance < -0.1:  # Strong selling pressure
+                short_score += 1
+            
+            if spread < 0.05:  # Tight spread - good for scalping
+                long_score += 0.5
+                short_score += 0.5
+        
+        # Generate final signal
+        signal_strength = abs(long_score - short_score)
+        
+        if long_score > short_score + 1.5 and signal_strength > 2:
+            return 'BUY', signal_strength
+        elif short_score > long_score + 1.5 and signal_strength > 2:
+            return 'SELL', signal_strength
+        else:
+            return 'HOLD', 0
+    
+    def calculate_scalping_position(self, symbol, account_balance, risk_per_trade=0.01):
+        """Calculate position size for scalping (smaller positions, faster turnover)"""
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            current_price = ticker['last']
+            
+            # For scalping, use smaller position size (0.5-2% of balance)
+            risk_amount = account_balance * risk_per_trade
+            
+            # Tight stop loss for scalping (0.3-0.8%)
+            stop_loss_pct = 0.005  # 0.5%
+            stop_loss_distance = current_price * stop_loss_pct
+            
+            if stop_loss_distance > 0:
+                position_size = risk_amount / stop_loss_distance
+            else:
+                position_size = 0
+            
+            # Apply maximum position limit for scalping
+            max_position = account_balance * 0.02 / current_price  # Max 2% exposure
+            position_size = min(position_size, max_position)
+            
+            # Get minimum order size
+            market = self.exchange.market(symbol)
+            min_amount = market['limits']['amount']['min']
+            
+            if position_size < min_amount * 2:  # Need at least 2x min amount
+                return 0
+            
+            return position_size
+            
+        except Exception as e:
+            print(f"Position calculation error: {e}")
+            return 0
+    
+    def place_perpetual_order(self, symbol, side, amount, order_type='market', 
+                             reduce_only=False, take_profit=None, stop_loss=None):
+        """Place order on perpetual contract with advanced options"""
+        try:
+            if amount <= 0:
+                return None
+            
+            params = {
+                'reduceOnly': reduce_only,
+            }
+            
+            # Add take profit and stop loss if provided
+            if take_profit:
+                params['takeProfitPrice'] = take_profit
+            
+            if stop_loss:
+                params['stopLossPrice'] = stop_loss
+            
+            order_params = {
+                'symbol': symbol,
+                'type': order_type,
+                'side': side,
+                'amount': amount,
+                'params': params
+            }
+            
+            print(f"Placing {side} order: {amount:.4f} {symbol} ({order_type})")
+            
+            if order_type == 'market':
+                order = self.exchange.create_market_order(**order_params)
+            else:
+                order = self.exchange.create_limit_order(**order_params)
+            
+            # Record order
+            self.order_history.append({
+                'timestamp': datetime.now(),
+                'symbol': symbol,
+                'side': side,
+                'amount': amount,
+                'type': order_type,
+                'price': order.get('price'),
+                'order_id': order.get('id'),
+                'status': 'filled' if order.get('filled') else 'open'
+            })
+            
+            print(f"Order placed: {order.get('id')}")
+            return order
+            
+        except Exception as e:
+            print(f"Order placement failed: {e}")
+            return None
+    
+    def manage_open_positions(self, symbol):
+        """Monitor and manage open positions with trailing stops"""
+        try:
+            positions = self.exchange.fetch_positions([symbol])
+            for position in positions:
+                if float(position['contracts']) != 0:
+                    entry_price = float(position['entryPrice'])
+                    current_price = float(position['markPrice'])
+                    pnl_pct = (current_price - entry_price) / entry_price * 100
+                    
+                    print(f"\nOpen Position: {symbol}")
+                    print(f"  Side: {position['side']}")
+                    print(f"  Size: {position['contracts']}")
+                    print(f"  Entry: ${entry_price:.2f}")
+                    print(f"  Current: ${current_price:.2f}")
+                    print(f"  P&L: {pnl_pct:+.2f}%")
+                    
+                    # Auto close rules for scalping
+                    if abs(pnl_pct) >= 0.8:  # Take profit at 0.8%
+                        close_side = 'sell' if position['side'] == 'long' else 'buy'
+                        self.place_perpetual_order(
+                            symbol, close_side, abs(float(position['contracts'])),
+                            reduce_only=True
+                        )
+                        print(f"  Auto-closed at {pnl_pct:.2f}% profit")
+                    elif abs(pnl_pct) <= -0.5:  # Stop loss at -0.5%
+                        close_side = 'sell' if position['side'] == 'long' else 'buy'
+                        self.place_perpetual_order(
+                            symbol, close_side, abs(float(position['contracts'])),
+                            reduce_only=True
+                        )
+                        print(f"  Stop loss triggered at {pnl_pct:.2f}% loss")
+        
+        except Exception as e:
+            print(f"Position management error: {e}")
+    
+    def run_scalping_cycle(self, symbols, initial_balance=1000):
+        """Execute one scalping cycle"""
+        print("\n" + "="*60)
+        print("1-MINUTE SCALPING BOT STARTED")
+        print(f"Time: {datetime.now()}")
+        print("="*60)
+        
+        for symbol in symbols:
+            print(f"\nAnalyzing {symbol}")
+            
+            try:
+                # Fetch latest data
+                df = self.fetch_perpetual_data(symbol, limit=100)
+                if df is None or len(df) < 50:
+                    continue
+                
+                # Fetch orderbook
+                orderbook = self.fetch_orderbook(symbol)
+                
+                # Calculate indicators
+                df = self.calculate_scalping_indicators(df)
+                
+                # Generate signal
+                signal, strength = self.generate_scalping_signal(df, orderbook)
+                
+                # Display analysis
+                latest = df.iloc[-1]
+                print(f"  Price: ${latest['close']:.2f}")
+                print(f"  EMA(5/10/20): ${latest['ema_5']:.2f}/${latest['ema_10']:.2f}/${latest['ema_20']:.2f}")
+                print(f"  RSI: {latest['rsi']:.1f}")
+                print(f"  Volume Ratio: {latest['volume_ratio']:.2f}")
+                print(f"  Signal: {signal} (Strength: {strength:.1f})")
+                
+                # Check for existing positions first
+                self.manage_open_positions(symbol)
+                
+                # Execute new trade if signal is strong
+                if signal != 'HOLD' and strength > 2.5:
+                    # Get account balance
+                    balance = self.exchange.fetch_balance()
+                    usdt_balance = balance.get('USDT', {}).get('free', initial_balance)
+                    
+                    # Calculate position
+                    position_size = self.calculate_scalping_position(symbol, usdt_balance)
+                    
+                    if position_size > 0:
+                        # Place order with tight stops
+                        order_side = 'buy' if signal == 'BUY' else 'sell'
+                        current_price = latest['close']
+                        
+                        # Calculate take profit and stop loss
+                        if order_side == 'buy':
+                            take_profit = current_price * 1.008  # 0.8% profit
+                            stop_loss = current_price * 0.995   # 0.5% loss
+                        else:
+                            take_profit = current_price * 0.992  # 0.8% profit
+                            stop_loss = current_price * 1.005    # 0.5% loss
+                        
+                        order = self.place_perpetual_order(
+                            symbol, order_side, position_size,
+                            take_profit=take_profit,
+                            stop_loss=stop_loss
+                        )
+                
+                # Avoid rate limits
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error processing {symbol}: {e}")
+                continue
+        
+        print(f"\nCycle completed at {datetime.now()}")
+    
+    def run_continuous(self, symbols, cycle_interval=60):
+        """Run bot continuously with specified interval (seconds)"""
+        print("Starting continuous scalping bot...")
+        print(f"Cycle interval: {cycle_interval} seconds")
+        print("Press Ctrl+C to stop")
+        
+        cycle_count = 0
+        try:
+            while True:
+                cycle_count += 1
+                print(f"\n{'#'*50}")
+                print(f"SCALPING CYCLE #{cycle_count}")
+                print(f"{'#'*50}")
+                
+                self.run_scalping_cycle(symbols)
+                
+                print(f"\nWaiting {cycle_interval} seconds for next cycle...")
+                time.sleep(cycle_interval)
+                
+        except KeyboardInterrupt:
+            print("\n\nBot stopped by user")
+        except Exception as e:
+            print(f"\nFatal error: {e}")
+
+def main():
+    """Main execution function"""
+    print("="*70)
+    print("1-MINUTE PERPETUAL SCALPING BOT")
+    print("Author: @HoxonAllan")
+    print("GitHub: https://github.com/Allan1128/1-Minute-Scalper-Bot")
+    print("="*70)
+    print("Register OKX: https://www.growthnode.systems/join/59892411")
+    print("Use invitation code for fee discounts")
+    print("="*70)
+    
+    # Configuration
+    SYMBOLS = ['BTC/USDT', 'ETH/USDT']  # Will be converted to BTC-USDT-SWAP
+    CYCLE_INTERVAL = 60  # Run every 60 seconds (1 minute)
+    
+    # Initialize bot
+    bot = OneMinuteScalper(exchange_id='okx')
+    
+    try:
+        # Run bot continuously
+        bot.run_continuous(SYMBOLS, CYCLE_INTERVAL)
+        
+    except Exception as e:
+        print(f"Bot error: {e}")
+    finally:
+        # Save order history
+        with open('scalping_orders.json', 'w') as f:
+            json.dump(bot.order_history, f, indent=2, default=str)
+        print("\nOrder history saved to scalping_orders.json")
+        print("Follow @HoxonAllan for more trading insights")
+
+if __name__ == "__main__":
+    # Create sample config file if it doesn't exist
+    try:
+        with open('config_perp.json', 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        sample_config = {
+            "api_key": "your_api_key_here",
+            "api_secret": "your_api_secret_here",
+            "password": "your_password_if_required"
+        }
+        with open('config_perp.json', 'w') as f:
+            json.dump(sample_config, f, indent=4)
+        print("Sample config_perp.json created. Please add your API credentials.")
+    
+    main()
